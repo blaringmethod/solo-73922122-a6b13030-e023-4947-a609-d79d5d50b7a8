@@ -1,0 +1,20 @@
+services:
+  source:
+    build: ./source
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+
+  collector:
+    build: ./collector
+    environment:
+      SOURCE_BASE_URL: http://source:8001
+      DATA_DIR: /data
+      # MAX_ARCHIVE_BYTES: "8388608"
+    volumes:
+      - ./data:/data        # SQLite + 分片 + 成品，重启后续传
+    ports:
+      - "8000:8000"
+    depends_on:
+      - source
+    restart: unless-stopped

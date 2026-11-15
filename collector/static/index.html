@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>探空报文采集台</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 1180px; margin: 0 auto; padding: 1.2rem; color: #222; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin: 0 0 .6rem; }
+  section { background: #fff; border: 1px solid #e2e2e2; border-radius: 8px;
+            padding: 1rem 1.2rem; margin-bottom: 1rem; }
+  button { padding: .32rem .8rem; border: 1px solid #bbb; border-radius: 5px;
+           background: #f7f7f7; cursor: pointer; font-size: .85rem; }
+  button:hover { background: #ececec; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.warn { background: #fff4e5; border-color: #d8a04a; }
+  input { padding: .3rem .5rem; border: 1px solid #bbb; border-radius: 5px; font-size: .9rem; }
+  table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  th, td { padding: .4rem .45rem; border-bottom: 1px solid #eee; text-align: left;
+           vertical-align: middle; }
+  th { background: #fafafa; white-space: nowrap; }
+  .bar { width: 140px; height: 12px; background: #eee; border-radius: 6px; overflow: hidden; }
+  .bar > div { height: 100%; background: #1f6feb; transition: width .3s; }
+  .bar.done > div { background: #2da44e; }
+  .bar.fail > div { background: #cf222e; }
+  .mono { font-family: ui-monospace, monospace; font-size: .76rem; }
+  .muted { color: #777; } .err { color: #cf222e; }
+  .badge { display: inline-block; padding: .1rem .5rem; border-radius: 10px;
+           font-size: .76rem; background: #eee; white-space: nowrap; }
+  .st-downloading { background: #ddf4ff; } .st-completed { background: #dafbe1; }
+  .st-failed { background: #ffebe9; } .st-paused { background: #fff8c5; }
+  .src-state { font-family: ui-monospace, monospace; background: #f6f8fa;
+               padding: .5rem .8rem; border-radius: 6px; display: inline-block; }
+  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  .hint { font-size: .78rem; color: #777; margin: .4rem 0 0; }
+  a.dl { font-size: .82rem; }
+</style>
+</head>
+<body>
+<h1>🎈 探空报文采集台</h1>
+
+<section>
+  <h2>演示数据源（故障注入）</h2>
+  <div class="row">
+    <span class="src-state" id="src-state">加载中…</span>
+  </div>
+  <div class="row" style="margin-top:.6rem">
+    <button onclick="setMode('normal')">正常</button>
+    <button onclick="setMode('ignore-range')">忽略 Range</button>
+    <button onclick="setMode('drop')">断流</button>
+    <button class="warn" onclick="bumpRevision()">更换修订（内容变更）</button>
+    <span>限速 <input id="throttle" type="number" min="0" value="0" style="width:6.5rem"> KiB/s</span>
+    <button onclick="applyThrottle()">应用限速</button>
+    <span class="muted" id="src-msg"></span>
+  </div>
+  <p class="hint">断流：响应中途断开连接；忽略 Range：续传请求也返回 200 全量；
+     更换修订：归档内容与 ETag 全部改变，采集端应放弃旧分片重新采集。</p>
+</section>
+
+<section>
+  <h2>新建采集</h2>
+  <div class="row">
+    <span>站号 <input id="station" value="54511" style="width:8rem"></span>
+    <span>日期 <input id="date" type="date"></span>
+    <button class="primary" id="create-btn" onclick="createJob()">开始采集</button>
+    <span class="muted" id="create-msg"></span>
+  </div>
+  <p class="hint">同一站号+日期只会有一个任务，重复点击安全。站号以 big 开头时演示源会生成
+     9 MiB 归档（超过 8 MiB 上限，用于演示拒绝）。</p>
+</section>
+
+<section>
+  <h2>采集任务</h2>
+  <table>
+    <thead><tr>
+      <th>ID</th><th>站号</th><th>日期</th><th>状态</th><th>进度</th>
+      <th>ETag / SHA-256</th><th>信息</th><th>操作</th>
+    </tr></thead>
+    <tbody id="jobs-body"><tr><td colspan="8" class="muted">暂无任务</td></tr></tbody>
+  </table>
+</section>
+
+<script>
+const STATUS_CN = { pending: '待开始', downloading: '下载中', paused: '已暂停',
+                    completed: '已完成', failed: '失败（可续传）' };
+const MODE_CN = { normal: '正常', 'ignore-range': '忽略 Range', drop: '断流' };
+
+function fmtBytes(n) {
+  if (n === null || n === undefined) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KiB';
+  return (n / 1048576).toFixed(2) + ' MiB';
+}
+const short = s => s ? s.slice(0, 12) + '…' : '—';
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let msg = 'HTTP ' + r.status;
+    try { const d = await r.json(); msg = d.detail || JSON.stringify(d); } catch (e) {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+async function post(path, body) {
+  return api(path, { method: 'POST',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined });
+}
+
+async function refreshSource() {
+  try {
+    const s = await api('/api/source/status');
+    document.getElementById('src-state').textContent =
+      `模式：${MODE_CN[s.mode] || s.mode}　修订：r${s.revision}　限速：${s.throttle_kbps} KiB/s`;
+    const t = document.getElementById('throttle');
+    if (document.activeElement !== t) t.value = s.throttle_kbps;
+  } catch (e) {
+    document.getElementById('src-state').textContent = '演示源不可达：' + e.message;
+  }
+}
+
+async function setMode(mode) { await post('/api/source/mode', { mode }); refreshSource(); }
+async function applyThrottle() {
+  const v = Math.max(0, parseInt(document.getElementById('throttle').value || '0', 10));
+  await post('/api/source/mode', { throttle_kbps: v }); refreshSource();
+}
+async function bumpRevision() {
+  await post('/api/source/revision');
+  document.getElementById('src-msg').textContent = '修订已更换，进行中的采集将检测到新 ETag 并重新采集';
+  refreshSource();
+}
+
+async function createJob() {
+  const btn = document.getElementById('create-btn');
+  btn.disabled = true;
+  try {
+    const station = document.getElementById('station').value.trim();
+    const date = document.getElementById('date').value;
+    await post('/api/jobs', { station, date, autostart: true });
+    document.getElementById('create-msg').textContent = '';
+  } catch (e) {
+    document.getElementById('create-msg').textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    refreshJobs();
+  }
+}
+
+async function jobAction(id, action, btn) {
+  if (btn) btn.disabled = true;   // 防止重复点击；服务端也有幂等保护
+  try { await post(`/api/jobs/${id}/${action}`); } catch (e) { alert(e.message); }
+  refreshJobs();
+}
+async function deleteJob(id, btn) {
+  if (btn) btn.disabled = true;
+  try { await api(`/api/jobs/${id}`, { method: 'DELETE' }); } catch (e) { alert(e.message); }
+  refreshJobs();
+}
+
+function actionButtons(j) {
+  const parts = [];
+  if (j.status === 'downloading') {
+    parts.push(`<button onclick="jobAction(${j.id},'pause',this)">暂停</button>`);
+  } else if (j.status === 'pending' || j.status === 'paused' || j.status === 'failed') {
+    parts.push(`<button class="primary" onclick="jobAction(${j.id},'start',this)">` +
+               (j.downloaded > 0 ? '续传' : '开始') + `</button>`);
+  }
+  if (j.can_download) {
+    parts.push(`<a class="dl" href="/api/jobs/${j.id}/download">⬇ 下载 ZIP</a>`);
+  }
+  parts.push(`<button onclick="deleteJob(${j.id},this)">删除</button>`);
+  return parts.join(' ');
+}
+
+async function refreshJobs() {
+  let jobs;
+  try { jobs = await api('/api/jobs'); }
+  catch (e) { return; }
+  const tbody = document.getElementById('jobs-body');
+  if (!jobs.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="muted">暂无任务</td></tr>';
+    return;
+  }
+  tbody.innerHTML = jobs.map(j => {
+    const pct = j.size ? Math.min(100, 100 * j.downloaded / j.size) : 0;
+    const barCls = j.status === 'completed' ? 'bar done' : (j.status === 'failed' ? 'bar fail' : 'bar');
+    const prog = `<div class="${barCls}"><div style="width:${pct.toFixed(1)}%"></div></div>` +
+      `<div class="mono">${fmtBytes(j.downloaded)} / ${j.size ? fmtBytes(j.size) : '?'}` +
+      ` (${pct.toFixed(1)}%)</div>`;
+    const info = j.error ? `<span class="err">${esc(j.error)}</span>` : '<span class="muted">—</span>';
+    return `<tr>
+      <td>${j.id}</td><td class="mono">${esc(j.station)}</td><td class="mono">${esc(j.date)}</td>
+      <td><span class="badge st-${j.status}">${STATUS_CN[j.status] || j.status}</span></td>
+      <td>${prog}</td>
+      <td class="mono" title="${esc(j.etag || '')}&#10;${esc(j.sha256 || '')}">${esc(short(j.etag))}<br>${esc(short(j.sha256))}</td>
+      <td>${info}</td>
+      <td style="white-space:nowrap">${actionButtons(j)}</td>
+    </tr>`;
+  }).join('');
+}
+
+document.getElementById('date').value = new Date().toISOString().slice(0, 10);
+refreshSource();
+refreshJobs();
+setInterval(refreshJobs, 1000);
+setInterval(refreshSource, 3000);
+</script>
+</body>
+</html>
